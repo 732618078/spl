@@ -1,0 +1,500 @@
+rm(list = ls())
+options(stringsAsFactors = F)
+
+#library##################################################
+library(tidyverse)
+library(rjson)
+library(parallel)
+library(foreach)
+library(doParallel)
+library(RCurl)
+library(RSelenium)
+library(XML)
+library(pheatmap)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(ConsensusClusterPlus)
+library(impute)
+#library(UpSetR)
+
+#数据处理###########################################################
+#设置路径
+# setwd('~/TCGA_data/TCGA-COAD/spl/')
+
+#读取数据
+spl_data <- read.table('../spl/PSI_download_COAD.txt',sep = '\t',header = T)
+
+#average PSI value ≥0.05
+mean_flag <- c()
+for (i in 1:nrow(spl_data)) {
+  per_row <- unlist(spl_data[i,seq(11,192)])
+  per_row <- per_row[!is.na(per_row)]
+  per_row_mean <- mean(per_row)
+  mean_flag <- c(mean_flag,per_row_mean>=0.05)
+}
+
+
+#35391 -> 26618
+spl_data <- spl_data[mean_flag,]
+
+
+#画箱线图##########################################################
+splice_type_count <- table(spl_data$splice_type)
+box_table <-tibble(Type=names(splice_type_count),event='AS event',Number=as.integer(splice_type_count))
+com_uni <- spl_data[,c("symbol","splice_type")]
+com_uni <- dplyr::distinct(com_uni)
+splice_type_count2 <- table(com_uni$splice_type)
+box_table2 <-tibble(Type=names(splice_type_count2),event='Gene symbol',Number=as.integer(splice_type_count2))
+
+box_table <- rbind(box_table,box_table2)
+
+p <- ggplot(data = box_table,mapping = aes(x=Type,y = Number,fill = event))+geom_bar(stat='identity', position='dodge') 
+p <- p+theme_classic()#调整样式
+p <- p+scale_fill_manual(values=c("red", "blue"))#bar图设置颜色
+p <- p+theme(legend.title = element_blank(),#图例标题无
+             legend.position = c(0.15,0.95),#图例位置
+             legend.background = element_rect(fill = "transparent"),
+             panel.border = element_rect(fill = "transparent",colour = 'black',size = 1,linetype = 1,inherit.blank = FALSE),
+             axis.title.x=element_text(size=24),
+             axis.title.y=element_text(size=24))# 图例背景色
+p <- p+scale_y_continuous(limits=c(0,20000),expand = c(0,0))#y轴从0开始
+
+
+ggsave(filename = 'event.pdf',plot = p,width = 5,height = 5,units = 'in',dpi = 320)
+ggsave(filename = 'event.tiff',plot = p,width = 5,height = 5,units = 'in',dpi = 320)
+
+#画upset图################################################
+
+#构建list 7元素
+upset_data <- spl_data[,c(1,3)]
+upset_data <- distinct(upset_data)
+
+AA <- upset_data[upset_data$splice_type=='AA',]$symbol
+AD <- upset_data[upset_data$splice_type=='AD',]$symbol
+AP <-	upset_data[upset_data$splice_type=='AP',]$symbol
+AT <-	upset_data[upset_data$splice_type=='AT',]$symbol
+ES <-	upset_data[upset_data$splice_type=='ES',]$symbol
+ME <-	upset_data[upset_data$splice_type=='ME',]$symbol
+RI <- upset_data[upset_data$splice_type=='RI',]$symbol
+
+upset_list <- list(
+  AA = AA ,
+  AD = AD ,
+  AP = AP ,
+  AT = AT ,
+  ES = ES ,
+  ME = ME ,
+  RI = RI
+)
+
+p_upset <- upset_plot(upset_list)
+pdf('upset.pdf',width = 10,height = 5)
+print(p_upset)
+dev.off()
+
+tiff('upset.tiff',width = 10,height = 5,units = 'in',res = 400)
+print(p_upset)
+dev.off()
+
+
+
+#找配对的样本做差异分析################################################
+diff_data <- spl_data[,c(-4:-10)]
+diff_data <- unite(diff_data,col = 'event',c('symbol','splice_type','as_id'))
+
+norm_sample <- colnames(diff_data)[substring(colnames(diff_data),nchar(colnames(diff_data))-3)=='Norm']
+tumor_name <- substr(norm_sample,1,12)
+
+all(tumor_name %in% colnames(diff_data))
+
+diff_data <- diff_data[,c('event',norm_sample,tumor_name)]
+
+
+#配对样本t检验试一试
+
+data_p <- c()
+logfc <- c()
+for(i in 1:nrow(diff_data)){
+  per_row_2 <- diff_data[i,]
+  if(length(unlist(per_row_2[2:42])[!is.na(unlist(per_row_2[2:42]))]) > 1){
+    p.value <- t.test(unlist(per_row_2[2:42]),unlist(per_row_2[43:83]),paired = T)$p.value
+    data_p <- c(data_p,p.value)
+  }else{
+    data_p <- c(data_p,NA)
+  }
+  per_logfc <- log2(mean(unlist(per_row_2[43:83])[!is.na(unlist(per_row_2[43:83]))])/mean(unlist(per_row_2[2:42])[!is.na(unlist(per_row_2[2:42]))]))
+  logfc <- c(logfc,per_logfc)
+
+}
+diff_data$p.value <- data_p
+
+fdr <- p.adjust(data_p,method = 'fdr')
+diff_data$fdr <- fdr
+
+diff_data$logfc <- logfc
+
+
+#选择|log2FC| ≥ 1, adjusted P < 0.05的事件
+
+filter_data <- diff_data[(abs(diff_data$logfc) >= 1)&(!is.na(diff_data$logfc)),]
+filter_data <- filter_data[(filter_data$fdr < 0.05)&(!is.na(filter_data$fdr)),]
+
+#669个事件是差异的
+
+#画一个热图、vol图和upset图  一个一个来
+#先画热图
+
+pheatmap_data <- filter_data[,c(2:83)]
+pheatmap_data[is.na(pheatmap_data)] <- 0
+
+
+# 构建列注释信息
+annotation_col = data.frame(
+  Type = factor(c(rep("Norm",  41),rep("Tumor",41)))
+)
+rownames(annotation_col) = colnames(pheatmap_data)
+
+
+p_heatmap <- pheatmap(pheatmap_data,
+         show_rownames=F,
+         show_colnames = F,
+         cluster_rows=T, 
+         cluster_cols=T,
+         annotation_col = annotation_col,
+         annotation_legend=T,
+         annotation_names_col = F
+         )
+
+ggsave(p_heatmap,filename = 'pheatmap.pdf',width = 7,height = 7,units = 'in')
+ggsave(p_heatmap,filename = 'pheatmap.tiff',width = 7,height = 7,units = 'in')
+
+#再画火山图
+
+vol_data <- diff_data[,c('event','logfc','fdr')]
+vol_data$logfdr <- -log10(vol_data$fdr)
+color_group <- rep('No significant',nrow(vol_data))
+
+
+color_group[(vol_data$logfc >= 1)&(vol_data$fdr < 0.05)] <- 'Up'
+color_group[(vol_data$logfc <= -1)&(vol_data$fdr < 0.05)] <- 'Down'
+vol_data$color <- color_group
+
+p=ggplot(data = vol_data,mapping = aes(x=logfc,y = logfdr))+
+  geom_point(aes(color=color),size=0.5)+
+  theme_classic()+
+  geom_vline(xintercept = c(-1,1),linetype=4)+
+  #geom_vline(xintercept = -1,linetype=4)+
+  geom_hline(yintercept = -log10(0.05),linetype=4)+
+  xlab('log2(Fold Change)')+
+  ylab('-log10(fdr)')+
+  theme(legend.title=element_blank(),legend.position = 'top')+
+  scale_color_manual(values =c('royalblue','lightseagreen','orangered'))
+  
+ggsave(p,filename = 'vol.pdf',width = 3,height = 3,units = 'in')
+ggsave(p,filename = 'vol.tiff',width = 3,height = 3,units = 'in')
+
+#画upset图
+upset_diff_data <- separate(filter_data,event,sep = '_',into = c('symbol','splice_type','as_id'))
+upset_diff_data <- upset_diff_data[,c(1,2)]
+
+upset_diff_data <- distinct(upset_diff_data)#601
+
+AA <- upset_diff_data[upset_diff_data$splice_type=='AA',]$symbol
+AD <- upset_diff_data[upset_diff_data$splice_type=='AD',]$symbol
+AP <-	upset_diff_data[upset_diff_data$splice_type=='AP',]$symbol
+AT <-	upset_diff_data[upset_diff_data$splice_type=='AT',]$symbol
+ES <-	upset_diff_data[upset_diff_data$splice_type=='ES',]$symbol
+ME <-	upset_diff_data[upset_diff_data$splice_type=='ME',]$symbol
+RI <- upset_diff_data[upset_diff_data$splice_type=='RI',]$symbol
+
+upset_diff_list <- list(
+  AA = AA ,
+  AD = AD ,
+  AP = AP ,
+  AT = AT ,
+  ES = ES ,
+  ME = ME ,
+  RI = RI
+)
+
+
+p_upset_2 <- upset_plot(upset_diff_list)
+pdf('upset_2.pdf',width = 10,height = 5)
+print(p_upset_2)
+dev.off()
+
+tiff('upset_2.tiff',width = 10,height = 5,units = 'in',res = 400)
+print(p_upset_2)
+dev.off()
+
+#case和基因表达量相关性################################################3
+#需要差异分析的结果
+
+DGE_up <- read.table('../up_genes')$V1 
+AS_up <- filter_data[filter_data$logfc>0,]$event
+AS_down <- filter_data[filter_data$logfc<0,]$event
+DGE_down <- read.table('../down_genes')$V1 
+
+AS_up <- sapply(AS_up, function(x){strsplit(x,split = '_')[[1]][1]})
+AS_down <- sapply(AS_down, function(x){strsplit(x,split = '_')[[1]][1]})
+
+AS_up <- unique(AS_up)
+AS_down <- unique(AS_down)
+
+venn_list <- list(
+  DGE_up = DGE_up,
+    AS_up =AS_up,
+    AS_down = AS_down,
+    DGE_down = DGE_down
+)
+
+my_venn <- venn_plot(venn_list)
+
+pdf('venn.pdf',width = 7,height = 7)
+grid.draw(my_venn)
+dev.off()
+tiff('venn.tiff',width = 7,height = 7,units = 'in',res = 400)
+grid.draw(my_venn)
+dev.off()
+
+AS_up_DGE_up <- intersect(AS_up,DGE_up)
+AS_up_DGE_down <- intersect(AS_up,DGE_down)
+AS_down_DGE_up <- intersect(AS_down,DGE_up)
+AS_down_DGE_down <- intersect(AS_down,DGE_down)
+
+#4 3
+per_DGE_up_with_two <- intersect(AS_down_DGE_up,AS_up_DGE_up)
+per_DGE_down_with_two <- intersect(AS_down_DGE_down,AS_up_DGE_down)
+
+#0 0
+intersect(AS_down_DGE_up,AS_down_DGE_down)
+intersect(AS_up_DGE_up,AS_up_DGE_down)
+
+#45个差异基因有差异AS事件
+DGEWithAS <- unique(c(AS_up_DGE_up,AS_up_DGE_down,AS_down_DGE_up,AS_down_DGE_down))
+#然后看这45个差异基因和他们差异事件的相关性
+#DGEWithAS 和filter_data
+
+filter_data2 <- separate(filter_data,col = 1,sep = '_',into = c('symbol','splice_type','as_id'))
+
+
+DGE_AS_data <- filter_data[filter_data2$symbol %in% DGEWithAS,]
+DGE_AS_data2 <- filter_data2[filter_data2$symbol %in% DGEWithAS,]
+
+#45个差异基因一共有55个AS事件
+DGE_exp <- read.table('../diffmRNAExp.txt')
+
+
+#
+DGE_exp <- DGE_exp[DGEWithAS,]
+DGE_exp <- DGE_exp[,substr(colnames(DGE_exp),14,16)=='01A']
+
+DGE_exp <- t(DGE_exp)
+DGE_exp <- log2(DGE_exp+0.001)
+id <- rownames(DGE_exp)
+id <- substring(id,1,12)
+id <- gsub('\\.','_',id)
+
+
+DGE_exp <- as.data.frame(DGE_exp)
+DGE_exp <- data.frame(id=id,DGE_exp)
+DGE_exp <- rm_dup_id(DGE_exp)
+
+
+
+#55个事件
+ASForDGE <- DGE_AS_data$event
+
+ASForDGE_data <- spl_data[,c(-4:-10)]
+ASForDGE_data <- unite(ASForDGE_data,col = 'event',c('symbol','splice_type','as_id'))
+
+rownames(ASForDGE_data) <- ASForDGE_data$event
+ASForDGE_data <- ASForDGE_data[ASForDGE,]
+ASForDGE_data <- ASForDGE_data[,-1]
+
+ASForDGE_data <- t(ASForDGE_data)
+ASForDGE_data <- as.data.frame(ASForDGE_data)
+ASForDGE_data <- data.frame(id=row.names(ASForDGE_data),ASForDGE_data)
+
+cor_data <- merge(DGE_exp,ASForDGE_data,by = 'id')
+
+ASForDGE_gene <- sapply(ASForDGE, function(x){strsplit(x,split = '_')[[1]][1]})
+#453
+
+cor_result <- data.frame(symbol=ASForDGE_gene,AS_event=ASForDGE,cor=NA,p=NA)
+
+
+for(i in 1:nrow(cor_result)){
+  per_cor_result_row <- cor_result[i,]
+  cor_aaa <- cor.test(cor_data[,per_cor_result_row$symbol],cor_data[,per_cor_result_row$AS_event],use = "complete.obs")
+  cor_result[i,'cor'] <- cor_aaa$estimate
+  cor_result[i,'p'] <- cor_aaa$p.value
+  
+}
+
+
+
+#做单变量COX回归分析##############################################
+
+#整理临床数据
+ext <- function(variables) {
+  
+  ifelse(is.null(variables),'NA',variables)
+  
+}
+col <- c(
+  'submitter_id',
+  'vital_status',
+  'days_to_death',
+  'days_to_last_follow_up',
+  'gender',
+  'age_at_index',
+  "ajcc_pathologic_t",
+  "ajcc_pathologic_m",
+  "ajcc_pathologic_n",
+  "ajcc_pathologic_stage"
+)
+
+#mRNA
+mRNA_clinical_file_list <- list.files('../../../../../../home/xbh/TCGA_data/TCGA-COAD/mRNA', pattern="clinical.cart.2020*",full.names = T)
+mRNA_clinical_file <- fromJSON(file = mRNA_clinical_file_list)
+
+mRNA_clinical_T <- sapply(mRNA_clinical_file,function(x){length(x)})==4
+
+mRNA_clinical_file <- mRNA_clinical_file[mRNA_clinical_T]
+
+mRNA_clinical <- tibble(col)
+
+for (mRNA_case in mRNA_clinical_file) {
+  
+  diagnoses <- mRNA_case[['diagnoses']][[1]]
+  #case_id   <- miRNA_case[['case_id']]
+  demographic <- mRNA_case[['demographic']]
+  #exposures <- miRNA_case[['exposures']][[1]]
+  
+  onecase <- c(ext(diagnoses$submitter_id),
+               ext(demographic$vital_status),
+               ext(demographic$days_to_death),
+               ext(diagnoses$days_to_last_follow_up),
+               ext(demographic$gender),
+               ext(demographic$age_at_index),
+               ext(diagnoses$ajcc_pathologic_t),
+               ext(diagnoses$ajcc_pathologic_m),
+               ext(diagnoses$ajcc_pathologic_n),
+               ext(diagnoses$ajcc_pathologic_stage)
+  )
+  mRNA_clinical[[substring(onecase[1],first = 1,last = 12)]] <- onecase
+}
+
+mRNA_clinical <- mRNA_clinical[,-1]
+mRNA_clinical <- t(mRNA_clinical)
+colnames(mRNA_clinical) <- col
+mRNA_clinical <- as_tibble(mRNA_clinical)
+
+mRNA_clinical$id <- gsub('-','_',substring(mRNA_clinical$submitter_id,first = 1,last = 12))
+mRNA_clinical <- mRNA_clinical[,-1]
+
+mRNA_clinical$os_days <- apply(mRNA_clinical, 1, function(x){ifelse(x[1]=='Dead',x[2],x[3])})
+mRNA_clinical$os_stat <- ifelse(mRNA_clinical$vital_status=='Alive',0,1)
+
+mRNA_clinical$os_days <- as.integer(mRNA_clinical$os_days)
+
+#TMN
+mRNA_clinical$TS <- substr(mRNA_clinical$ajcc_pathologic_t,1,2)
+mRNA_clinical$TS[!(mRNA_clinical$TS=='T0'|mRNA_clinical$TS=='T1'|mRNA_clinical$TS=='T2'|mRNA_clinical$TS=='T3'|mRNA_clinical$TS=='T4')] <- NA
+
+mRNA_clinical$M <- substr(mRNA_clinical$ajcc_pathologic_m,1,2)
+mRNA_clinical$M[!(mRNA_clinical$M=='M0'|mRNA_clinical$M=='M1')] <- NA
+
+mRNA_clinical$N <- substr(mRNA_clinical$ajcc_pathologic_n,1,2)
+mRNA_clinical$N[!(mRNA_clinical$N=='N0'|mRNA_clinical$N=='N1'|mRNA_clinical$N=='N2'|mRNA_clinical$N=='N3')] <- NA
+
+mRNA_clinical$stage <- str_remove(mRNA_clinical$ajcc_pathologic_stage,'A|B|C|D')
+mRNA_clinical$stage[!(mRNA_clinical$stage=='Stage I'|mRNA_clinical$stage=='Stage II'|mRNA_clinical$stage=='Stage III'|mRNA_clinical$stage=='Stage IV')] <- NA
+
+#mRNA_clinical_exp <- merge(mRNA_clinical,mRNA_exp,by = 'id')
+
+#处理psi矩阵，然后整合
+psi_exp <- spl_data[,c(-4:-10)]
+psi_exp <- unite(psi_exp,col = 'event',c('symbol','splice_type','as_id'))
+
+#psi_exp <- spl_data[,c(-2,-4:-10)]
+#psi_exp <- unite(psi_exp,col = 'event',c('symbol','splice_type'))
+
+
+#去除Norm标识的
+psi_exp <- psi_exp[,!(substr(colnames(psi_exp),14,17)=='Norm')]
+
+#去除90天以下的患者
+mRNA_clinical <- mRNA_clinical[mRNA_clinical$os_days>90,]
+
+#转置exp矩阵并合并
+rownames(psi_exp) <- psi_exp$event
+psi_exp <- psi_exp[,-1]
+
+# num <- nrow(psi_exp)*0.2
+# fun <- function(x){sum(x==0)}
+# s <- apply(psi_exp, 1, fun)
+# psi_exp <- psi_exp[which(s<num),]
+# 
+# dimnames <- list(rownames(psi_exp), colnames(psi_exp))
+# exp <- matrix(as.numeric(as.matrix(psi_exp)), nrow=nrow(psi_exp), dimnames=dimnames)
+# mat <- impute.knn(exp)
+# psi_exp <- mat$data
+
+
+psi_exp <-  t(psi_exp)
+psi_exp <- as.data.frame(psi_exp)
+# input_data <- cbind(id=rownames(psi_exp),psi_exp)
+# write.table(input_data,"input_data.txt",sep="\t",quote=F,row.names=F)
+
+#psi_exp <- as.numeric(psi_exp)
+
+#psi_exp <- apply(psi_exp, 2, as.numeric)
+
+#psi_exp <- as.data.frame(psi_exp)
+
+psi_exp$id <- rownames(psi_exp)
+
+cox_exp <- merge(mRNA_clinical,psi_exp,by = 'id')
+
+
+clinical <- mRNA_clinical[,c(4:ncol(mRNA_clinical))]
+
+clinical$age <- ifelse(as.numeric(clinical$age_at_index>65),">65","<=65")
+clinical <- clinical[,-c(2:6)]
+clinical <- as.data.frame(na.omit(clinical))
+clinical <- cbind(clinical[,2:ncol(clinical)],clinical[,1])
+colnames(clinical)[2:4] <- c("futime","fustat","T")
+colnames(clinical)[9] <- "gender"
+write.table(clinical,"clinical.txt",sep="\t",quote=F,row.names=F)
+
+
+cl <- makeCluster(40)
+registerDoParallel(cl)
+
+outTab <- foreach(i = colnames(cox_exp[,17:ncol(cox_exp)]),.combine = 'rbind') %dopar% {
+  cox <- survival::coxph(survival::Surv(os_days, os_stat) ~ as.numeric(cox_exp[,i]), data = cox_exp)
+  coxSummary = summary(cox)
+  coxP=coxSummary$coefficients[,"Pr(>|z|)"]
+  
+  return(c(gene=i,
+           HR=coxSummary$conf.int[,"exp(coef)"],
+           HR.95L=coxSummary$conf.int[,"lower .95"],
+           HR.95H=coxSummary$conf.int[,"upper .95"],
+           pvalue=coxSummary$coefficients[,"Pr(>|z|)"]
+  )
+  )
+  
+  
+}
+
+stopCluster(cl)
+write.table(outTab,file="uniCox.xls",sep="\t",row.names=F,quote=F)
+
+
+test <- cox_exp[,c(1,11:ncol(cox_exp))]
+test <- test[,-c(4:7)]
+colnames(test)[2:3] <- c("futime","fustat")
+test <- test[,c("id","futime","fustat","CXCL12_AT_11344","SULT1A1_ES_35819","LRRC36_AT_37015","SLC13A3_AT_59696","TCF7_ES_73350")]
+write.table(test,"input.txt",quote=F,sep="\t",row.names=F)
