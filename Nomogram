@@ -1,0 +1,38 @@
+#install.packages("rms")
+
+library(survival)
+library(rms)
+library(tibble)
+library(regplot)
+
+
+# setwd(dir)
+# inputfile="clinical.txt"
+rt=read.table("clinical.txt",header=T,sep="\t",check.names=F)
+rt$T <- ifelse(rt$T=="T1"|rt$T=="T2","T1+T2","T3+T4")
+rt$N <- ifelse(rt$N=="N0","N0","N1+N2")
+rt$stage <- ifelse(rt$stage=="Stage I"|rt$stage=="Stage II","Stage I+II","Stage III+IV")
+
+
+risk <- read.table("risk.txt", header=T, sep="\t", check.names=F)
+risk <- risk[,c(1, ncol(risk)-1, ncol(risk))]
+rt <- merge(rt, risk, by='id', how='inner')
+rt <- rt[,-(ncol(rt))]
+rt <- column_to_rownames(rt, 'id')
+
+rt[,"futime"]=rt[,"futime"]/365
+rt$T <- as.factor(rt$T)
+rt$M <- as.factor(rt$M)
+rt$N <- as.factor(rt$N)
+rt$stage <- as.factor(rt$stage)
+rt$age <- as.factor(rt$age)
+rt$gender <- as.factor(rt$gender)
+# rt$risk <- as.factor(rt$risk)
+
+dd <- datadist(rt)
+options(datadist="dd")
+
+f <- cph(Surv(futime,fustat) ~ T+M+N+stage+age+gender+riskScore,surv=T,x=T, y=T,data=rt)
+summary(f)
+surv <- Survival(f)
+regplot(f, clickable=F, observation=T, droplines=T, plots=c("violin", "spikes"), title="Nomogram", showP=T, subticks=T, dencol="yellow", boxcol="grey", obscol="red", leftlabel=T, points=T,rank="range", failtime=c(1, 3, 5), prfail=T)
