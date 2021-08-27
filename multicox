@@ -1,0 +1,50 @@
+library(survival)
+library(survminer)
+set.seed(123456)
+
+rt=read.table("input.txt",header=T,sep="\t",check.names=F,row.names=1)
+rt$CXCL12_AT_11344[is.na(rt$CXCL12_AT_11344)]<-median(rt$CXCL12_AT_11344,na.rm=T)
+rt$SULT1A1_ES_35819[is.na(rt$SULT1A1_ES_35819)]<-median(rt$SULT1A1_ES_35819,na.rm=T)
+rt$LRRC36_AT_37015[is.na(rt$LRRC36_AT_37015)]<-median(rt$LRRC36_AT_37015,na.rm=T)
+rt$SLC13A3_AT_59696[is.na(rt$SLC13A3_AT_59696)] <- median(rt$SLC13A3_AT_59696,na.rm=T)
+rt$TCF7_ES_73350[is.na(rt$TCF7_ES_73350)] <- median(rt$TCF7_ES_73350,na.rm=T)
+
+inTrain <- createDataPartition(y=rt$fustat, p=0.7, list=F)
+train <- rt[inTrain, ]
+train_data <- cbind(id=rownames(train),train)
+write.table(train_data, "train_data.txt", sep="\t", quote=F, row.names=F)
+test <- rt[-inTrain, ]
+test_data <- cbind(id=rownames(test),test)
+write.table(test_data, "test_data.txt", sep="\t", quote=F, row.names=F)
+
+
+# rt[,3:ncol(rt)]=log2(rt[,3:ncol(rt)]+0.001)
+train[,"futime"]=train[,"futime"]/365
+cox <- coxph(Surv(futime, fustat) ~ ., data = train)
+# cox=step(cox,direction = "both")
+riskScore=predict(cox,type="risk",newdata=train)
+summary=summary(cox)
+coxGene=rownames(summary$coefficients)
+# coxGene=gsub("`","",coxGene)
+outCol=c("futime","fustat",coxGene)
+risk=as.vector(ifelse(riskScore>median(riskScore),"high","low"))
+write.table(cbind(id=rownames(cbind(train[,outCol],riskScore,risk)),cbind(train[,outCol],riskScore,risk)),
+    file="risk.txt",
+    sep="\t",
+    quote=F,
+    row.names=F)
+write.table(cbind(id=coxGene,summary$coefficients),
+    file="coxResult.xls",
+    sep="\t",
+    quote=F,
+    row.names=F)
+cox
+
+pdf(file="forest.pdf",width=6.4,height=4)
+ggforest(cox,
+         main = "Hazard ratio",
+         cpositions = c(0.02,0.22, 0.4), 
+         fontsize = 0.7, 
+         refLabel = "reference", 
+         noDigits=2)
+dev.off()
